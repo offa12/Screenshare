@@ -1,0 +1,448 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Accept licenses and install SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+      - name: Write project files
+        run: |
+          mkdir -p ScreenShare/app
+          cat > ScreenShare/app/build.gradle.kts <<'EOF_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.screenshare"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.screenshare"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_0
+          mkdir -p ScreenShare/app/src/main
+          cat > ScreenShare/app/src/main/AndroidManifest.xml <<'EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="عرض الشاشة"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MirrorService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p ScreenShare/app/src/main/java/com/example/screenshare
+          cat > ScreenShare/app/src/main/java/com/example/screenshare/MainActivity.kt <<'EOF_2'
+          package com.example.screenshare
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var link: TextView
+              private lateinit var quality: RadioGroup
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (20 * d).toInt()
+
+                  fun label(t: String, size: Float) = TextView(this).apply {
+                      text = t; textSize = size; setPadding(0, (8 * d).toInt(), 0, (8 * d).toInt())
+                  }
+
+                  status = label("", 18f)
+                  link = label("", 20f).apply { setTextIsSelectable(true) }
+
+                  quality = RadioGroup(this).apply {
+                      listOf("منخفضة (أسرع)", "متوسطة", "عالية (أبطأ)").forEachIndexed { i, t ->
+                          addView(RadioButton(context).apply { id = i + 1; text = t })
+                      }
+                      check(2)
+                  }
+
+                  val start = Button(this).apply { text = "ابدأ مشاركة الشاشة"; setOnClickListener { begin() } }
+                  val stop = Button(this).apply {
+                      text = "إيقاف المشاركة"
+                      setOnClickListener {
+                          startService(Intent(context, MirrorService::class.java).setAction(MirrorService.ACTION_STOP))
+                          postDelayed({ refresh() }, 500)
+                      }
+                  }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      layoutDirection = View.LAYOUT_DIRECTION_RTL
+                      setPadding(pad, pad, pad, pad)
+                      addView(label("عرض الشاشة", 28f))
+                      addView(status)
+                      addView(link)
+                      addView(label("جودة العرض", 16f))
+                      addView(quality)
+                      addView(start)
+                      addView(stop)
+                      addView(label(
+                          "على التلفزيون: افتح المتصفح واكتب العنوان الظاهر فوق. " +
+                              "الموبايل والتلفزيون لازم يكونوا على نفس شبكة الواي فاي.", 14f
+                      ))
+                  }
+                  setContentView(ScrollView(this).apply { fitsSystemWindows = true; addView(root) })
+              }
+
+              override fun onResume() { super.onResume(); refresh() }
+
+              private fun refresh() {
+                  if (MirrorService.running) {
+                      status.text = "المشاركة شغالة"
+                      val ip = localIp()
+                      link.text = if (ip != null) "http://$ip:${MirrorService.PORT}" else "اتصل بشبكة واي فاي"
+                  } else {
+                      status.text = "المشاركة متوقفة"
+                      link.text = ""
+                  }
+              }
+
+              private fun begin() {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  else askCapture()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) = askCapture()
+
+              private fun askCapture() {
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req != 100 || res != RESULT_OK || data == null) return
+                  val (scale, q, fps) = when (quality.checkedRadioButtonId) {
+                      1 -> Triple(0.4f, 50, 10)
+                      3 -> Triple(0.8f, 75, 20)
+                      else -> Triple(0.6f, 65, 15)
+                  }
+                  startForegroundService(
+                      Intent(this, MirrorService::class.java)
+                          .putExtra("code", res).putExtra("data", data)
+                          .putExtra("scale", scale).putExtra("quality", q).putExtra("fps", fps)
+                  )
+                  link.postDelayed({ refresh() }, 700)
+              }
+
+              private fun localIp(): String? =
+                  NetworkInterface.getNetworkInterfaces().toList()
+                      .flatMap { it.inetAddresses.toList() }
+                      .firstOrNull { !it.isLoopbackAddress && it is Inet4Address && it.isSiteLocalAddress }
+                      ?.hostAddress
+          }
+          EOF_2
+          mkdir -p ScreenShare/app/src/main/java/com/example/screenshare
+          cat > ScreenShare/app/src/main/java/com/example/screenshare/MirrorService.kt <<'EOF_3'
+          package com.example.screenshare
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import java.io.ByteArrayOutputStream
+
+          class MirrorService : Service() {
+              companion object {
+                  const val ACTION_STOP = "stop"
+                  const val PORT = 8080
+                  @Volatile var running = false
+              }
+
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var server: MjpegServer? = null
+              private var worker: HandlerThread? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              @Suppress("DEPRECATION")
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent == null || intent.action == ACTION_STOP) { stopAll(); return START_NOT_STICKY }
+                  showNotification()
+                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33)
+                      intent.getParcelableExtra("data", Intent::class.java) else intent.getParcelableExtra("data")
+                  if (data == null || running) { if (data == null) stopAll(); return START_NOT_STICKY }
+                  startCapture(
+                      intent.getIntExtra("code", 0), data,
+                      intent.getFloatExtra("scale", 0.6f),
+                      intent.getIntExtra("quality", 65),
+                      intent.getIntExtra("fps", 15)
+                  )
+                  return START_NOT_STICKY
+              }
+
+              private fun showNotification() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("mirror", "مشاركة الشاشة", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, MirrorService::class.java).setAction(ACTION_STOP), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  @Suppress("DEPRECATION")
+                  val n = Notification.Builder(this, "mirror")
+                      .setContentTitle("جاري مشاركة الشاشة")
+                      .setContentText("اضغط إيقاف لإنهاء البث")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .addAction(android.R.drawable.ic_media_pause, "إيقاف", stop)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  else startForeground(1, n)
+              }
+
+              private fun startCapture(code: Int, data: Intent, scale: Float, quality: Int, fps: Int) {
+                  running = true
+                  val thread = HandlerThread("capture").also { it.start() }
+                  worker = thread
+                  val handler = Handler(thread.looper)
+
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  val proj = mpm.getMediaProjection(code, data)
+                  projection = proj
+                  // مطلوب من أندرويد 14: تسجيل callback قبل إنشاء الشاشة الافتراضية
+                  proj.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() { stopAll() }
+                  }, handler)
+
+                  val m = resources.displayMetrics
+                  val w = ((m.widthPixels * scale).toInt() / 2) * 2
+                  val h = ((m.heightPixels * scale).toInt() / 2) * 2
+                  val img = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  reader = img
+
+                  val srv = MjpegServer(PORT).also { it.start() }
+                  server = srv
+
+                  val minGap = 1000L / fps.coerceIn(1, 30)
+                  var lastSent = 0L
+                  img.setOnImageAvailableListener({ r ->
+                      val image = try { r.acquireLatestImage() } catch (_: Exception) { null } ?: return@setOnImageAvailableListener
+                      try {
+                          val now = System.currentTimeMillis()
+                          if (srv.clients > 0 && now - lastSent >= minGap) {
+                              lastSent = now
+                              val p = image.planes[0]
+                              val padding = (p.rowStride - p.pixelStride * w) / p.pixelStride
+                              val full = Bitmap.createBitmap(w + padding, h, Bitmap.Config.ARGB_8888)
+                              full.copyPixelsFromBuffer(p.buffer)
+                              val bmp = if (padding > 0) Bitmap.createBitmap(full, 0, 0, w, h) else full
+                              val out = ByteArrayOutputStream()
+                              bmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
+                              if (bmp !== full) bmp.recycle()
+                              full.recycle()
+                              srv.publish(out.toByteArray())
+                          }
+                      } finally { image.close() }
+                  }, handler)
+
+                  display = proj.createVirtualDisplay(
+                      "mirror", w, h, m.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, img.surface, null, handler
+                  )
+              }
+
+              private fun stopAll() {
+                  if (running) {
+                      running = false
+                      try { display?.release() } catch (_: Exception) { }
+                      try { reader?.close() } catch (_: Exception) { }
+                      try { projection?.stop() } catch (_: Exception) { }
+                      server?.stop()
+                      worker?.quitSafely()
+                  }
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+              }
+
+              override fun onDestroy() { stopAll(); super.onDestroy() }
+          }
+          EOF_3
+          mkdir -p ScreenShare/app/src/main/java/com/example/screenshare
+          cat > ScreenShare/app/src/main/java/com/example/screenshare/MjpegServer.kt <<'EOF_4'
+          package com.example.screenshare
+
+          import java.net.ServerSocket
+          import java.net.Socket
+          import kotlin.concurrent.thread
+
+          /** سيرفر HTTP بسيط: / صفحة تعرض البث، و /stream بث MJPEG. */
+          class MjpegServer(private val port: Int) {
+              @Volatile private var running = false
+              @Volatile var clients = 0
+                  private set
+              private var socket: ServerSocket? = null
+              private val lock = Object()
+              private var frame: ByteArray? = null
+              private var seq = 0L
+
+              fun start() {
+                  running = true
+                  thread(name = "mjpeg-accept") {
+                      try {
+                          val ss = ServerSocket(port).also { socket = it }
+                          while (running) {
+                              val s = ss.accept()
+                              thread(name = "mjpeg-client") { handle(s) }
+                          }
+                      } catch (_: Exception) { }
+                  }
+              }
+
+              fun publish(jpeg: ByteArray) {
+                  synchronized(lock) { frame = jpeg; seq++; lock.notifyAll() }
+              }
+
+              fun stop() {
+                  running = false
+                  try { socket?.close() } catch (_: Exception) { }
+                  synchronized(lock) { lock.notifyAll() }
+              }
+
+              private fun handle(s: Socket) {
+                  clients++
+                  try {
+                      s.tcpNoDelay = true
+                      val reader = s.getInputStream().bufferedReader()
+                      val request = reader.readLine() ?: return
+                      while (true) { val l = reader.readLine(); if (l.isNullOrEmpty()) break }
+                      val path = request.split(" ").getOrNull(1) ?: "/"
+                      val out = s.getOutputStream()
+
+                      if (!path.startsWith("/stream")) {
+                          val html = "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>" +
+                              "<body style='margin:0;background:#000'>" +
+                              "<img src='/stream' style='width:100vw;height:100vh;object-fit:contain'></body>"
+                          val body = html.toByteArray()
+                          out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n" +
+                              "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())
+                          out.write(body); out.flush()
+                          return
+                      }
+
+                      out.write(("HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n" +
+                          "Cache-Control: no-cache\r\nConnection: close\r\n\r\n").toByteArray())
+                      var last = -1L
+                      while (running) {
+                          var f: ByteArray? = null
+                          synchronized(lock) {
+                              while (running && seq == last) lock.wait(1000)
+                              f = frame; last = seq
+                          }
+                          val data = f ?: continue
+                          out.write(("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${data.size}\r\n\r\n").toByteArray())
+                          out.write(data)
+                          out.write("\r\n".toByteArray())
+                          out.flush()
+                      }
+                  } catch (_: Exception) {
+                  } finally {
+                      clients--
+                      try { s.close() } catch (_: Exception) { }
+                  }
+              }
+          }
+          EOF_4
+          cat > ScreenShare/build.gradle.kts <<'EOF_5'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF_5
+          cat > ScreenShare/gradle.properties <<'EOF_6'
+          org.gradle.jvmargs=-Xmx2048m
+          android.nonTransitiveRClass=true
+          EOF_6
+          cat > ScreenShare/settings.gradle.kts <<'EOF_7'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ScreenShare"
+          include(":app")
+          EOF_7
+      - name: Build
+        working-directory: ScreenShare
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenShare-apk
+          path: ScreenShare/app/build/outputs/apk/debug/app-debug.apk
