@@ -4,12 +4,12 @@ jobs:
 build:
 runs-on: ubuntu-latest
 steps:
- _ uses: actions/checkout@v3 
-_ name: Set up JDK
-uses: actions/setup-java@v3
+ uses: actions/checkout@v3 
+ name: Set up JDK
+ uses: actions/setup-java@v3
 with:
 distribution: temurin
-java-version: '10' 
+java-version: '17' 
 name: Grant execute permission for gradlew
 run: chmod +x gradlew
 name: Build APK with Gradle
@@ -17,4 +17,4 @@ run: ./gradlew assembleDebug
 uses: actions/upload artifact@v3
 with:
 name: artifact
-path: app/build/outputs/apk/debug
+path: app/build/outputs/apk/app-debug.apk
